@@ -57,7 +57,7 @@ export default async function handler(req, res) {
     const body = req.body;
 
     // Green API отправляет сообщения в таком формате
-    const messageData = body?.body;
+    const messageData = body;
     if (!messageData || messageData.typeWebhook !== "incomingMessageReceived") {
       return res.status(200).json({ ok: true });
     }
