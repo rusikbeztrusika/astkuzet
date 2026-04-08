@@ -1,0 +1,9 @@
+{
+  "name": "ast-kuzet-whatsapp-agent",
+  "version": "1.0.0",
+  "description": "WhatsApp AI Agent for AST-KUZET",
+  "main": "api/webhook.js",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0"
+  }
+}
