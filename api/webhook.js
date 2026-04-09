@@ -90,18 +90,21 @@ export default async function handler(req, res) {
     const messageData = req.body;
     const webhookType = messageData?.typeWebhook;
 
-    // Обрабатываем исходящие сообщения (команды #стоп/#старт от менеджера)
+    // Исходящие сообщения от менеджера
     if (webhookType === "outgoingMessageReceived") {
       const text = messageData.messageData?.textMessageData?.textMessage?.trim();
       const chatId = messageData.senderData?.chatId;
       if (chatId) {
-        if (text === "#стоп") await setPaused(chatId, true);
-        if (text === "#старт") await setPaused(chatId, false);
+        if (text === "#старт") {
+          await setPaused(chatId, false); // включить бота
+        } else {
+          await setPaused(chatId, true); // любое сообщение менеджера = пауза бота
+        }
       }
       return res.status(200).json({ ok: true });
     }
 
-    // Обрабатываем только входящие сообщения
+    // Только входящие
     if (webhookType !== "incomingMessageReceived") {
       return res.status(200).json({ ok: true });
     }
@@ -111,7 +114,7 @@ export default async function handler(req, res) {
     const chatId = senderData.chatId;
     const messageId = messageData.idMessage;
 
-    // Защита от дублей — проверяем ID сообщения
+    // Защита от дублей
     if (messageId) {
       const alreadyProcessed = await isProcessed(messageId);
       if (alreadyProcessed) return res.status(200).json({ ok: true });
