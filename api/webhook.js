@@ -4,6 +4,9 @@ import { createClient } from "@supabase/supabase-js";
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
 const SYSTEM_PROMPT = `Ты менеджер по продажам охранного агентства AST-KUZET, Караганда. Общаешься с клиентами в WhatsApp. Цель — выявить потребность и довести до заявки.
 
 КОМПАНИЯ: ТОО «AST KUZET M», с 2007 года, 18 лет, 1000+ объектов, лицензия №23006587, ул.Лободы 25/3, 9:00-18:00, тел. +7 705 775 14 75, ast-kuzet.kz. Клиенты: BMW центр, REDPARK, WOOPPAY.
@@ -32,6 +35,16 @@ const SYSTEM_PROMPT = `Ты менеджер по продажам охранн�
 - На вопрос "ты бот?" — честно: "Да, помощник AST-KUZET. Могу ответить на вопросы или передать менеджеру"`;
 
 const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+
+async function sendTelegram(text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: "HTML" }),
+    });
+  } catch {}
+}
 
 async function getHistory(chatId) {
   try {
@@ -66,7 +79,7 @@ async function isProcessed(messageId) {
   try {
     const { data } = await supabase
       .from("processed_messages")
-      .select("id")
+      .select("message_id")
       .eq("message_id", messageId)
       .single();
     return !!data;
@@ -87,24 +100,54 @@ export default async function handler(req, res) {
   }
 
   try {
-    const messageData = req.body;
-    const webhookType = messageData?.typeWebhook;
+    const body = req.body;
 
-    // Исходящие сообщения от менеджера
-    if (webhookType === "outgoingMessageReceived") {
-      const text = messageData.messageData?.textMessageData?.textMessage?.trim();
-      const chatId = messageData.senderData?.chatId;
-      if (chatId) {
-        if (text === "#старт") {
-          await setPaused(chatId, false); // включить бота
-        } else {
-          await setPaused(chatId, true); // любое сообщение менеджера = пауза бота
+    // Telegram webhook — команды от менеджера
+    if (body?.message?.text) {
+      const text = body.message.text.trim();
+      const fromId = String(body.message.chat.id);
+
+      if (fromId === String(TELEGRAM_CHAT_ID)) {
+        if (text.startsWith("/стоп ")) {
+          const phone = text.replace("/стоп ", "").trim();
+          const chatId = `${phone}@c.us`;
+          await setPaused(chatId, true);
+          await sendTelegram(`✅ Бот остановлен для ${phone}`);
+        } else if (text.startsWith("/старт ")) {
+          const phone = text.replace("/старт ", "").trim();
+          const chatId = `${phone}@c.us`;
+          await setPaused(chatId, false);
+          await sendTelegram(`✅ Бот включён для ${phone}`);
+        } else if (text === "/список") {
+          const { data } = await supabase
+            .from("chat_history")
+            .select("chat_id, paused, updated_at")
+            .eq("paused", true);
+          if (data?.length) {
+            const list = data.map(d => `• ${d.chat_id.replace("@c.us", "")}`).join("\n");
+            await sendTelegram(`⏸ Боты на паузе:\n${list}`);
+          } else {
+            await sendTelegram("Нет чатов на паузе");
+          }
         }
       }
       return res.status(200).json({ ok: true });
     }
 
-    // Только входящие
+    // WhatsApp webhook
+    const messageData = body;
+    const webhookType = messageData?.typeWebhook;
+
+    // Исходящие — ставим паузу автоматически
+    if (webhookType === "outgoingMessageReceived") {
+      const text = messageData.messageData?.textMessageData?.textMessage?.trim();
+      const chatId = messageData.senderData?.chatId;
+      if (chatId && text !== "#старт") {
+        await setPaused(chatId, true);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
     if (webhookType !== "incomingMessageReceived") {
       return res.status(200).json({ ok: true });
     }
@@ -113,6 +156,7 @@ export default async function handler(req, res) {
     const messageBody = messageData.messageData;
     const chatId = senderData.chatId;
     const messageId = messageData.idMessage;
+    const senderName = senderData.senderName || "Клиент";
 
     // Защита от дублей
     if (messageId) {
@@ -134,8 +178,13 @@ export default async function handler(req, res) {
     }
 
     const incomingText = messageBody.textMessageData.textMessage.trim();
+    const phone = chatId.replace("@c.us", "");
 
     const { messages, paused, updated_at } = await getHistory(chatId);
+
+    // Уведомление в Telegram о новом сообщении
+    await sendTelegram(`📩 <b>${senderName}</b> (+${phone})\n${incomingText}\n\n${paused ? "⏸ Бот на паузе" : "🤖 Бот отвечает"}\n\nОстановить: /стоп ${phone}\nВключить: /старт ${phone}`);
+
     if (paused) return res.status(200).json({ ok: true });
 
     const isNewSession = !updated_at || (Date.now() - new Date(updated_at).getTime()) > TWELVE_HOURS;
@@ -160,7 +209,9 @@ export default async function handler(req, res) {
 
     if (replyText.includes("[ЗАЯВКА:")) {
       const match = replyText.match(/\[ЗАЯВКА:([^\]]+)\]/);
-      if (match) console.log(`🔔 ЗАЯВКА (${chatId}): ${match[1].trim()}`);
+      if (match) {
+        await sendTelegram(`🔔 <b>НОВАЯ ЗАЯВКА!</b>\n${match[1].trim()}\nНомер: +${phone}`);
+      }
     }
 
     await fetch(`https://api.green-api.com/waInstance${process.env.GREEN_API_ID}/sendMessage/${process.env.GREEN_API_TOKEN}`, {
