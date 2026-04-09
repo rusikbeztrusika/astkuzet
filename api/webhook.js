@@ -62,6 +62,25 @@ async function setPaused(chatId, paused) {
   });
 }
 
+async function isProcessed(messageId) {
+  try {
+    const { data } = await supabase
+      .from("processed_messages")
+      .select("id")
+      .eq("message_id", messageId)
+      .single();
+    return !!data;
+  } catch {
+    return false;
+  }
+}
+
+async function markProcessed(messageId) {
+  try {
+    await supabase.from("processed_messages").insert({ message_id: messageId });
+  } catch {}
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(200).json({ message: "AST-KUZET Agent running" });
@@ -69,14 +88,37 @@ export default async function handler(req, res) {
 
   try {
     const messageData = req.body;
-    if (!messageData || messageData.typeWebhook !== "incomingMessageReceived") {
+    const webhookType = messageData?.typeWebhook;
+
+    // Обрабатываем исходящие сообщения (команды #стоп/#старт от менеджера)
+    if (webhookType === "outgoingMessageReceived") {
+      const text = messageData.messageData?.textMessageData?.textMessage?.trim();
+      const chatId = messageData.senderData?.chatId;
+      if (chatId) {
+        if (text === "#стоп") await setPaused(chatId, true);
+        if (text === "#старт") await setPaused(chatId, false);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // Обрабатываем только входящие сообщения
+    if (webhookType !== "incomingMessageReceived") {
       return res.status(200).json({ ok: true });
     }
 
     const senderData = messageData.senderData;
     const messageBody = messageData.messageData;
     const chatId = senderData.chatId;
+    const messageId = messageData.idMessage;
 
+    // Защита от дублей — проверяем ID сообщения
+    if (messageId) {
+      const alreadyProcessed = await isProcessed(messageId);
+      if (alreadyProcessed) return res.status(200).json({ ok: true });
+      await markProcessed(messageId);
+    }
+
+    // Ответ на голосовые, фото, видео
     if (messageBody?.typeMessage !== "textMessage") {
       if (["audioMessage", "imageMessage", "videoMessage", "documentMessage"].includes(messageBody?.typeMessage)) {
         await fetch(`https://api.green-api.com/waInstance${process.env.GREEN_API_ID}/sendMessage/${process.env.GREEN_API_TOKEN}`, {
@@ -89,9 +131,6 @@ export default async function handler(req, res) {
     }
 
     const incomingText = messageBody.textMessageData.textMessage.trim();
-
-    if (incomingText === "#стоп") { await setPaused(chatId, true); return res.status(200).json({ ok: true }); }
-    if (incomingText === "#старт") { await setPaused(chatId, false); return res.status(200).json({ ok: true }); }
 
     const { messages, paused, updated_at } = await getHistory(chatId);
     if (paused) return res.status(200).json({ ok: true });
