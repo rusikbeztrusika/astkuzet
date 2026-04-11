@@ -6,45 +6,112 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const SHEETS_ID = process.env.GOOGLE_SHEETS_ID;
+const SHEETS_EMAIL = process.env.GOOGLE_SERVICE_EMAIL;
+const SHEETS_KEY = process.env.GOOGLE_PRIVATE_KEY;
 
-const SYSTEM_PROMPT = `Ты менеджер охранного агентства AST-KUZET (Казахстан, Караганда). Переписка в WhatsApp.
+const SYSTEM_PROMPT = `Ты представитель охранного агентства AST-KUZET (Казахстан, Караганда). Переписка в WhatsApp.
 
-СТИЛЬ ОБЩЕНИЯ:
-Пиши как живой человек в мессенджере. Коротко. Одна мысль — одно сообщение. Максимум 2-3 строки. Никаких длинных объяснений. Никаких вводных фраз типа "Понятно", "Отлично", "Хороший вопрос". Сразу по делу. Один вопрос за раз — никогда не задавай два вопроса в одном сообщении.
+СТИЛЬ: профессиональный и вежливый, но кратко. Можно сказать "рад помочь" или "хорошо" — но только один раз и по месту. Без длинных объяснений. Один вопрос за раз. Максимум 2-3 строки на ответ. Если клиент сказал "спасибо" или не ответил — не пиши больше ничего.
 
-Примеры правильных ответов:
-— "Какой объект — магазин, офис, склад?"
-— "Есть ли сейчас охрана?"
-— "Тревожная кнопка от 10 000 ₸/мес, монтаж бесплатно. Какой объект?"
-— "Для точного расчёта нужен выезд менеджера. Оставите контакты?"
+О КОМПАНИИ: ТОО «AST KUZET M», с 2007 года, 18 лет, 1000+ объектов, лицензия №23006587, ул.Лободы 25/3, 9:00-18:00, тел. +7 705 775 14 75, ast-kuzet.kz.
 
-КОМПАНИЯ: ТОО «AST KUZET M», с 2007 года, 18 лет, 1000+ объектов, лицензия №23006587, ул.Лободы 25/3, 9:00-18:00, тел. +7 705 775 14 75, ast-kuzet.kz.
-
-ЦЕНЫ:
-- Тревожная кнопка: от 10 000 ₸/мес, монтаж и оборудование бесплатно
+УСЛУГИ И ЦЕНЫ:
+- Тревожная кнопка: от 10 000 ₸/мес (монтаж и оборудование бесплатно)
 - Пультовая охрана: от 12 000 ₸/мес
-- Квартира: от 8 000 ₸/мес
-- Физохрана: от 900 ₸/час
-- Видеонаблюдение, пожарка: по смете
+- Охрана квартиры: от 8 000 ₸/мес
+- Физическая охрана: от 900 ₸/час — по вопросам писать Данияру: +7 701 336 66 93
+- Видеонаблюдение, пожарная сигнализация: по смете
+- Оборудование отдельно не продаём
 
-КЛЮЧЕВЫЕ ПРЕИМУЩЕСТВА (упоминай когда уместно):
-- ГБР за 7-12 минут, прописано в договоре
-- Матответственность до 1,5 млн ₸
-- 18 лет на рынке, 1000+ объектов
-- Первые 30 дней бесплатно
+ПРЕИМУЩЕСТВА: ГБР за 7-12 минут (в договоре), материальная ответственность до 1,5 млн ₸, первые 30 дней бесплатно.
 
-ЦЕЛЬ: выяснить тип объекта → предложить решение → получить контакты для менеджера.
+ПЕРЕАДРЕСАЦИЯ:
+- Вакансии, работа, трудоустройство → "По трудоустройству: Диана, +7 702 214 53 36"
+- Физическая охрана → "По физохране: Данияр, +7 701 336 66 93"
+- Оборудование отдельно → "Оборудование отдельно не продаём. Только в комплексе с услугами."
 
-ЗАЯВКА: когда клиент готов — собери имя, телефон, адрес. Напиши: [ЗАЯВКА: имя — телефон — адрес — тип объекта]
+ЦЕЛЬ: узнать тип объекта → назвать цену или направить к нужному человеку → получить контакты.
 
-НЕЛЬЗЯ:
-- Комментировать слова клиента ("действительно дорого", "серьёзный объект")
-- Задавать два вопроса сразу
-- Писать длинные абзацы
-- Придумывать цены и факты
-- Здороваться повторно если диалог уже идёт`;
+ЗАЯВКА: когда клиент готов подключиться — собери имя, телефон, адрес. Напиши: [ЗАЯВКА: имя — телефон — адрес — тип объекта]
+
+ЗАПРЕЩЕНО:
+- Писать больше 2-3 строк
+- Задавать 2 вопроса сразу
+- Комментировать слова клиента
+- Здороваться повторно
+- Придумывать цены и факты`;
 
 const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+
+// Google Sheets JWT Auth
+async function getGoogleToken() {
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const now = Math.floor(Date.now() / 1000);
+  const claim = btoa(JSON.stringify({
+    iss: SHEETS_EMAIL,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  }));
+
+  const pemKey = SHEETS_KEY.replace(/\\n/g, "\n");
+  const keyData = pemKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+  const binaryKey = Uint8Array.from(atob(keyData), c => c.charCodeAt(0));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8", binaryKey.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false, ["sign"]
+  );
+
+  const signingInput = `${header}.${claim}`;
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5", cryptoKey,
+    new TextEncoder().encode(signingInput)
+  );
+
+  const jwt = `${signingInput}.${btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "")}`;
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+
+  const tokenData = await tokenRes.json();
+  return tokenData.access_token;
+}
+
+async function addToSheets(name, phone, firstMessage) {
+  try {
+    const token = await getGoogleToken();
+    const date = new Date().toLocaleString("ru-RU", { timeZone: "Asia/Almaty" });
+    const values = [[
+      "", // № — автоматически
+      date,
+      name,
+      `+${phone}`,
+      firstMessage,
+      "",
+      "Новый",
+      "",
+      "",
+    ]];
+
+    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_ID}/values/CRM_Клиенты!A:I:append?valueInputOption=USER_ENTERED`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ values }),
+    });
+  } catch (e) {
+    console.error("Sheets error:", e);
+  }
+}
 
 async function sendTelegramWithButtons(text, phone) {
   try {
@@ -156,11 +223,9 @@ export default async function handler(req, res) {
       await markProcessed(messageId);
     }
 
-    // Сначала проверяем паузу
     const { messages, paused, updated_at } = await getHistory(chatId);
     if (paused) return res.status(200).json({ ok: true });
 
-    // Голосовые и файлы — только если не на паузе
     if (messageBody?.typeMessage !== "textMessage") {
       if (["audioMessage", "imageMessage", "videoMessage", "documentMessage"].includes(messageBody?.typeMessage)) {
         await fetch(`https://api.green-api.com/waInstance${process.env.GREEN_API_ID}/sendMessage/${process.env.GREEN_API_TOKEN}`, {
@@ -176,22 +241,25 @@ export default async function handler(req, res) {
     const isNewSession = !updated_at || (Date.now() - new Date(updated_at).getTime()) > TWELVE_HOURS;
 
     if (isNewSession) {
+      // Уведомление в Telegram
       await sendTelegramWithButtons(
         `📩 <b>Новый клиент!</b>\n👤 ${senderName} (+${phone})\n\n💬 ${incomingText}`,
         phone
       );
+      // Добавляем в Google Sheets
+      await addToSheets(senderName, phone, incomingText);
     }
 
     const historyToUse = isNewSession ? [] : messages;
     historyToUse.push({ role: "user", content: incomingText });
 
     const systemWithContext = SYSTEM_PROMPT + (isNewSession
-      ? "\n\nПервое сообщение клиента — поздоровайся одним словом и задай один уточняющий вопрос."
+      ? "\n\nПервое сообщение клиента — поздоровайся кратко и задай один уточняющий вопрос."
       : "\n\nДиалог продолжается — не здоровайся. Отвечай коротко.");
 
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 300,
+      max_tokens: 200,
       system: systemWithContext,
       messages: historyToUse,
     });
