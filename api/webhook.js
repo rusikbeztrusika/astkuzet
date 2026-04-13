@@ -42,7 +42,23 @@ const SYSTEM_PROMPT = `Ты представитель охранного аге
 - Здороваться повторно
 - Придумывать цены и факты`;
 
+const FOLLOWUP_PROMPT = `Ты представитель охранного агентства AST-KUZET. Проанализируй диалог с клиентом и реши — нужно ли отправить follow-up сообщение.
+
+НЕ отправляй если клиент:
+- Сказал "не интересует", "не надо", "нет", "не сейчас", "не актуально"
+- Оставил заявку (уже передан менеджеру)
+- Получил переадресацию на Диану или Данияра
+
+ОТПРАВЛЯЙ если клиент:
+- Спросил цену или условия но пропал
+- Сказал "подумаю", "посмотрим", "позже"
+- Диалог просто оборвался без ответа
+
+Если нужно отправить — напиши короткое (1-2 строки) напоминание. Вежливо, без давления.
+Если не нужно — ответь только словом: НЕТ`;
+
 const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+const TWENTYFOUR_HOURS = 24 * 60 * 60 * 1000;
 
 async function getGoogleToken() {
   const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -107,6 +123,14 @@ async function addToSheets(name, phone, firstMessage) {
   }
 }
 
+async function sendWhatsApp(chatId, message) {
+  await fetch(`https://api.green-api.com/waInstance${process.env.GREEN_API_ID}/sendMessage/${process.env.GREEN_API_TOKEN}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId, message }),
+  });
+}
+
 async function sendTelegramWithButtons(text, phone) {
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
@@ -141,12 +165,12 @@ async function getHistory(chatId) {
   try {
     const { data } = await supabase
       .from("chat_history")
-      .select("messages, paused, updated_at")
+      .select("messages, paused, updated_at, followup_sent")
       .eq("chat_id", chatId)
       .single();
-    return data || { messages: [], paused: false, updated_at: null };
+    return data || { messages: [], paused: false, updated_at: null, followup_sent: false };
   } catch {
-    return { messages: [], paused: false, updated_at: null };
+    return { messages: [], paused: false, updated_at: null, followup_sent: false };
   }
 }
 
@@ -185,7 +209,60 @@ async function markProcessed(messageId) {
   } catch {}
 }
 
+// Follow-up cron handler
+async function handleFollowups() {
+  const cutoff = new Date(Date.now() - TWENTYFOUR_HOURS).toISOString();
+
+  const { data: chats } = await supabase
+    .from("chat_history")
+    .select("chat_id, messages, updated_at, followup_sent")
+    .lt("updated_at", cutoff)
+    .eq("paused", false)
+    .eq("followup_sent", false);
+
+  if (!chats?.length) return;
+
+  for (const chat of chats) {
+    if (!chat.messages?.length) continue;
+
+    // Последнее сообщение должно быть от бота (assistant)
+    const lastMsg = chat.messages[chat.messages.length - 1];
+    if (lastMsg.role !== "assistant") continue;
+
+    // Claude решает — отправлять ли follow-up
+    const dialogText = chat.messages
+      .slice(-6)
+      .map(m => `${m.role === "user" ? "Клиент" : "Бот"}: ${m.content}`)
+      .join("\n");
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 100,
+      messages: [{ role: "user", content: `${FOLLOWUP_PROMPT}\n\nДиалог:\n${dialogText}` }],
+    });
+
+    const decision = response.content[0].text.trim();
+
+    if (decision === "НЕТ") {
+      // Помечаем чтобы больше не проверять
+      await supabase.from("chat_history").update({ followup_sent: true }).eq("chat_id", chat.chat_id);
+      continue;
+    }
+
+    // Отправляем follow-up
+    await sendWhatsApp(chat.chat_id, decision);
+    await supabase.from("chat_history").update({ followup_sent: true }).eq("chat_id", chat.chat_id);
+    console.log(`Follow-up sent to ${chat.chat_id}: ${decision}`);
+  }
+}
+
 export default async function handler(req, res) {
+  // Cron job для follow-up
+  if (req.method === "GET" && req.query?.cron === "followup") {
+    await handleFollowups();
+    return res.status(200).json({ ok: true });
+  }
+
   if (req.method !== "POST") {
     return res.status(200).json({ message: "AST-KUZET Agent running" });
   }
@@ -194,14 +271,12 @@ export default async function handler(req, res) {
     const body = req.body;
     const webhookType = body?.typeWebhook;
 
-    // Исходящие с телефона — ставим паузу
     if (webhookType === "outgoingMessageReceived") {
       const chatId = body.senderData?.chatId;
       if (chatId) await setPaused(chatId, true);
       return res.status(200).json({ ok: true });
     }
 
-    // Исходящие через API (ответы бота) — игнорируем
     if (webhookType === "outgoingAPIMessageReceived") {
       return res.status(200).json({ ok: true });
     }
@@ -228,11 +303,7 @@ export default async function handler(req, res) {
 
     if (messageBody?.typeMessage !== "textMessage") {
       if (["audioMessage", "imageMessage", "videoMessage", "documentMessage"].includes(messageBody?.typeMessage)) {
-        await fetch(`https://api.green-api.com/waInstance${process.env.GREEN_API_ID}/sendMessage/${process.env.GREEN_API_TOKEN}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chatId, message: "Напишите текстом или позвоните: +7 705 775 14 75" }),
-        });
+        await sendWhatsApp(chatId, "Напишите текстом или позвоните: +7 705 775 14 75");
       }
       return res.status(200).json({ ok: true });
     }
@@ -248,8 +319,22 @@ export default async function handler(req, res) {
       await addToSheets(senderName, phone, incomingText);
     }
 
+    // Сбрасываем followup_sent когда клиент написал снова
+    await supabase.from("chat_history").upsert({
+      chat_id: chatId,
+      followup_sent: false,
+    });
+
+    // Задержка: 45 сек для нового клиента, 25 сек для продолжения
+    const delay = isNewSession ? 45000 : 25000;
+    await new Promise(resolve => setTimeout(resolve, delay));
+
     const historyToUse = isNewSession ? [] : messages;
     historyToUse.push({ role: "user", content: incomingText });
+
+    // Задержка: 45 сек для нового клиента, 25 сек для продолжения
+    const delay = isNewSession ? 45000 : 25000;
+    await new Promise(resolve => setTimeout(resolve, delay));
 
     const systemWithContext = SYSTEM_PROMPT + (isNewSession
       ? "\n\nПервое сообщение клиента — поздоровайся кратко и задай один уточняющий вопрос."
@@ -273,11 +358,7 @@ export default async function handler(req, res) {
       }
     }
 
-    await fetch(`https://api.green-api.com/waInstance${process.env.GREEN_API_ID}/sendMessage/${process.env.GREEN_API_TOKEN}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chatId, message: replyText }),
-    });
+    await sendWhatsApp(chatId, replyText);
 
     return res.status(200).json({ ok: true });
   } catch (error) {
