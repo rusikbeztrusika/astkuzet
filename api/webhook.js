@@ -326,8 +326,7 @@ export default async function handler(req, res) {
     });
 
     // Задержка: 45 сек для нового клиента, 25 сек для продолжения
-    const delay = isNewSession ? 45000 : 25000;
-    await new Promise(resolve => setTimeout(resolve, delay));
+    await new Promise(resolve => setTimeout(resolve, isNewSession ? 45000 : 25000));
 
     const historyToUse = isNewSession ? [] : messages;
     historyToUse.push({ role: "user", content: incomingText });
