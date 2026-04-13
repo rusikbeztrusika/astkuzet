@@ -44,7 +44,6 @@ const SYSTEM_PROMPT = `Ты представитель охранного аге
 
 const TWELVE_HOURS = 12 * 60 * 60 * 1000;
 
-// Google Sheets JWT Auth
 async function getGoogleToken() {
   const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const now = Math.floor(Date.now() / 1000);
@@ -88,28 +87,23 @@ async function addToSheets(name, phone, firstMessage) {
   try {
     const token = await getGoogleToken();
     const date = new Date().toLocaleString("ru-RU", { timeZone: "Asia/Almaty" });
-    const values = [[
-      "", // № — автоматически
-      date,
-      name,
-      `+${phone}`,
-      firstMessage,
-      "",
-      "Новый",
-      "",
-      "",
-    ]];
+    const values = [["", date, name, `+${phone}`, firstMessage, "", "Новый", "", ""]];
 
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_ID}/values/CRM_Клиенты!A:I:append?valueInputOption=USER_ENTERED`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ values }),
-    });
+    const response = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SHEETS_ID}/values/CRM%20%D0%9A%D0%BB%D0%B8%D0%B5%D0%BD%D1%82%D1%8B!A:I:append?valueInputOption=USER_ENTERED`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ values }),
+      }
+    );
+    const result = await response.json();
+    console.log("Sheets result:", JSON.stringify(result));
   } catch (e) {
-    console.error("Sheets error:", e);
+    console.error("Sheets error:", e.message);
   }
 }
 
@@ -200,9 +194,15 @@ export default async function handler(req, res) {
     const body = req.body;
     const webhookType = body?.typeWebhook;
 
+    // Исходящие с телефона — ставим паузу
     if (webhookType === "outgoingMessageReceived") {
       const chatId = body.senderData?.chatId;
       if (chatId) await setPaused(chatId, true);
+      return res.status(200).json({ ok: true });
+    }
+
+    // Исходящие через API (ответы бота) — игнорируем
+    if (webhookType === "outgoingAPIMessageReceived") {
       return res.status(200).json({ ok: true });
     }
 
@@ -241,12 +241,10 @@ export default async function handler(req, res) {
     const isNewSession = !updated_at || (Date.now() - new Date(updated_at).getTime()) > TWELVE_HOURS;
 
     if (isNewSession) {
-      // Уведомление в Telegram
       await sendTelegramWithButtons(
         `📩 <b>Новый клиент!</b>\n👤 ${senderName} (+${phone})\n\n💬 ${incomingText}`,
         phone
       );
-      // Добавляем в Google Sheets
       await addToSheets(senderName, phone, incomingText);
     }
 
